@@ -1,24 +1,43 @@
-import os
-
 import chainlit as cl
 from dotenv import load_dotenv
 from langchain.chains.query_constructor.base import AttributeInfo
 from langchain.retrievers import SelfQueryRetriever
-from langchain_core.output_parsers import StrOutputParser
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.runnables import Runnable, RunnableConfig, RunnablePassthrough
+from langchain_core.runnables import RunnableConfig
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_pinecone import PineconeVectorStore
-from pinecone import Pinecone
+from langfuse import Langfuse
+from langfuse.model import TextPromptClient
 
 
 @cl.on_chat_start
 async def start_chatbot():
     llm = ChatOpenAI(model="gpt-4o-mini")
+    langfuse = Langfuse()
+    system_prompt = langfuse.get_prompt("vibechat_system_prompt")
+    cl.user_session.set("llm", llm)
+    cl.user_session.set("rag_retriever", create_rag_retriever(llm))
+    cl.user_session.set("system_prompt", system_prompt)
+
+
+@cl.on_message
+async def on_message(message: cl.Message):
+    llm = cl.user_session.get("llm")  # type: ChatOpenAI
+    msg = cl.Message(content="")
+    async for chunk in llm.astream(
+            compile_prompt_with_retrieved_data(message.content),
+            config=RunnableConfig(callbacks=[cl.LangchainCallbackHandler()]),
+    ):
+        await msg.stream_token(chunk.content)
+
+    await msg.send()
+
+
+def create_rag_retriever(llm: ChatOpenAI) -> SelfQueryRetriever:
+    vector_store = PineconeVectorStore(
+        index_name="vibechat",
+        embedding=OpenAIEmbeddings(model="text-embedding-3-large")
+    )
     document_content_description = "The manual of the car Opel Ampera"
-    embeddings = OpenAIEmbeddings(model="text-embedding-3-large")
-    pc = Pinecone(api_key=os.environ.get("PINECONE_API_KEY"))
-    vector_store = PineconeVectorStore(index_name="vibechat", embedding=embeddings)
     metadata_field_info = [
         AttributeInfo(
             name="car_type",
@@ -26,53 +45,23 @@ async def start_chatbot():
             type="string"
         )
     ]
-    prompt = ChatPromptTemplate.from_messages(
-        [
-            (
-                "system",
-                """
-                I would like you to take on the following role. You have access to the Opel Ampera User Manual through a RAG pipeline.
-                Based on the data retrieved from it, answer the questions asked. If the answer cannot be found in the manual, respond with an answer that indicates you cannot answer the question.
-
-                Answer as if you were the car itself, speaking directly to your driver. The buttons and the knobs are yours, talk about them as they are your parts. 
-                You should talk like a rock star!
-                """
-
-            ),
-            ("human", "{context}"),
-            ("human", "{question}")
-        ]
-    )
-    retriever = SelfQueryRetriever.from_llm(
+    return SelfQueryRetriever.from_llm(
         llm=llm,
         vectorstore=vector_store,
         document_contents=document_content_description,
         metadata_field_info=metadata_field_info
     )
 
-    def format_docs(docs):
-        return "\n\n".join(doc.page_content for doc in docs)
 
-    runnable = (
-            {"context": retriever | format_docs, "question": RunnablePassthrough()}
-            | prompt
-            | llm
-            | StrOutputParser()
-    )
-    cl.user_session.set("runnable", runnable)
+def compile_prompt_with_retrieved_data(question: str):
+    rag_retriever = cl.user_session.get("rag_retriever")  # type: SelfQueryRetriever
+    system_prompt = cl.user_session.get("system_prompt")  # type:  TextPromptClient
+    results = format_docs(rag_retriever.invoke(question))
+    return system_prompt.compile(context=results, question=question)
 
 
-@cl.on_message
-async def on_message(message: cl.Message):
-    runnable = cl.user_session.get("runnable")  # type: Runnable
-    msg = cl.Message(content="")
-    async for chunk in runnable.astream(
-            {"question": message.content},
-            config=RunnableConfig(callbacks=[cl.LangchainCallbackHandler()]),
-    ):
-        await msg.stream_token(chunk)
-
-    await msg.send()
+def format_docs(docs):
+    return "\n\n".join(doc.page_content for doc in docs)
 
 
 def main():

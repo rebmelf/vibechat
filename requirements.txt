@@ -4,6 +4,7 @@ langchain-core
 langchain_community
 langchain-openai
 langchain-pinecone
+langfuse
 pinecone-notebooks
 pinecone
 pypdf
